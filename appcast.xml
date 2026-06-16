@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sparkle appcast feed for ClaudeAutoResume.
+
+  Served (read-only) from this file's raw GitHub URL — see SUFeedURL in
+  Sources/ClaudeAutoResumeApp/Info.plist:
+    https://raw.githubusercontent.com/milika/claude-auto-resume/main/appcast.xml
+
+  To publish a new version:
+    1. Run ./Scripts/release.sh <version> to build + sign the DMG and print
+       a sparkle:edSignature value.
+    2. Add a new <item> below, updating:
+         - sparkle:version            -> CFBundleVersion (build number)
+         - sparkle:shortVersionString -> CFBundleShortVersionString
+         - pubDate                    -> release date (RFC 822 format)
+         - enclosure url              -> the GitHub Release asset URL
+         - enclosure length           -> the DMG's size in bytes
+         - enclosure sparkle:edSignature -> output of `sign_update`
+         - <description>              -> release notes (HTML)
+    3. Commit appcast.xml to `main` — Sparkle clients pick up the new entry
+       on their next scheduled check (see SUScheduledCheckInterval).
+-->
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+    <channel>
+        <title>ClaudeAutoResume</title>
+        <link>https://raw.githubusercontent.com/milika/claude-auto-resume/main/appcast.xml</link>
+        <description>Update feed for ClaudeAutoResume.</description>
+        <language>en</language>
+        <item>
+            <title>Version 1.0</title>
+            <pubDate>Tue, 16 Jun 2026 12:56:46 +0000</pubDate>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>1.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[
+                <h2>Initial public release</h2>
+                <ul>
+                    <li>Watches <strong>Claude Desktop</strong> windows and
+                        <strong>Claude Code</strong> running in Terminal.app
+                        for usage-limit banners.</li>
+                    <li>Reads the reset time Claude reports and waits
+                        precisely for it, then types <code>continue</code>
+                        and sends it automatically.</li>
+                    <li>Tracks multiple conversations independently, each
+                        on its own timer.</li>
+                    <li>Lives in the menu bar, launches at login, and keeps
+                        a local activity log you can inspect from the
+                        menu.</li>
+                </ul>
+            ]]></description>
+            <enclosure
+                url="https://github.com/milika/claude-auto-resume/releases/download/v1.0/ClaudeAutoResume-1.0.dmg"
+                length="1690436"
+                type="application/octet-stream"
+                sparkle:edSignature="M0h20G7NZ4aZrSw/yAu9xY6kkwfx8O1zFLUTkEgOBvpp6CZmx0MjNK0vPhwlIU0uMjTnd4HsroPdlNVm96p+Cg==" />
+        </item>
+    </channel>
+</rss>

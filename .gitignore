@@ -1,0 +1,13 @@
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+build/
+dist/
+
+# Sparkle EdDSA private signing key — never commit this.
+sparkle_private_key*
+
+# Project docs (machine-local — see docs/current-progress.md for context)
+docs/
+
