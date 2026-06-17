@@ -20,7 +20,7 @@ let package = Package(
             dependencies: [
                 "ClaudeAutoResumeCore",
                 "ClaudeAutoResumeAX",
-                .product(name: "Sparkle", package: "sparkle-project/Sparkle"),
+                .product(name: "Sparkle", package: "Sparkle"),
             ]
         ),
         .testTarget(name: "ClaudeAutoResumeCoreTests", dependencies: ["ClaudeAutoResumeCore"]),

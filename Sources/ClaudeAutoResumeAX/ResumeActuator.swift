@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import CoreGraphics
 
@@ -27,11 +28,24 @@ public enum ResumeActuator {
 
         // A background/off-Space Electron window's AX tree can expose only its
         // window chrome, with no chat input, until the window becomes the
-        // focused renderer. Clicking the center of its frame can bring it into
-        // focus so the AX tree repopulates; retry the search once afterwards.
-        if inputAdapter == nil, let frame = root.frame {
-            clickCenter(of: frame, window: window)
-            inputAdapter = AXTreeWalker.findFirst(in: root, where: { isTextInput($0) }) as? AXUIElementAdapter
+        // focused renderer. Two flavors of nudge, depending on what AX reports:
+        //
+        //   - frame != nil  → click the window center; this brings Claude to
+        //                     the front and the AX tree repopulates.
+        //   - frame == nil  → the window isn't even reporting geometry to AX.
+        //                     That means Claude isn't frontmost at all
+        //                     (background window, hidden behind another app,
+        //                     screen-locked, off-Space). kAXRaiseAction on the
+        //                     window alone doesn't help here for Electron apps
+        //                     — we have to frontmost the whole application via
+        //                     NSRunningApplication so macOS asks AX to
+        //                     repopulate the tree. (Observed in the 2026-06-17
+        //                     ~00:20 activity log: 6 consecutive .inputNotFound
+        //                     retries, all with frame=nil and only menu-bar
+        //                     elements in the tree, because Claude was in the
+        //                     background.)
+        if inputAdapter == nil {
+            inputAdapter = nudgeAndRefindInput(window: window, root: root)
         }
 
         guard let inputAdapter else {
@@ -82,6 +96,37 @@ public enum ResumeActuator {
         retDown.postToPid(pid)
         retUp.postToPid(pid)
         return .sent
+    }
+
+    /// Best-effort nudge to bring Claude to the front when its AX tree doesn't
+    /// expose a chat input. Tries (in order): click the window center if AX
+    /// reports a frame, otherwise frontmost the whole application. Returns the
+    /// (possibly newly discovered) input adapter, or `nil` if no nudge
+    /// succeeded.
+    ///
+    /// Exposed `internal` for unit testing of the failure paths — see
+    /// `ResumeActuatorTests`.
+    internal static func nudgeAndRefindInput(
+        window: AXUIElement,
+        root: AXUIElementAdapter
+    ) -> AXUIElementAdapter? {
+        if let frame = root.frame {
+            clickCenter(of: frame, window: window)
+            return AXTreeWalker.findFirst(in: root, where: { isTextInput($0) }) as? AXUIElementAdapter
+        }
+
+        // frame == nil — Claude isn't frontmost at all. Frontmost the
+        // application (kAXRaiseAction on the window alone doesn't work for
+        // Electron apps behind other windows or on another Space).
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(window, &pid) == .success,
+              let app = NSRunningApplication(processIdentifier: pid),
+              app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        else { return nil }
+
+        // Give AX a moment to repopulate the tree before re-searching.
+        Thread.sleep(forTimeInterval: 0.5)
+        return AXTreeWalker.findFirst(in: root, where: { isTextInput($0) }) as? AXUIElementAdapter
     }
 
     /// Posts a left-click at the center of `frame` directly to `window`'s
