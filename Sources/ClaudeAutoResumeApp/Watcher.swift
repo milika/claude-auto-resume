@@ -103,6 +103,16 @@ public final class Watcher {
     /// `performResume` to decide whether a `.sent` outcome should suppress
     /// further attempts (see `ResumeRetryPolicy`).
     private var pendingResumeWasStale: [String: Bool] = [:]
+    /// Whether the most recent resume for a window ran with a stale AX handle
+    /// (CGWindowList saw Claude on-screen but the AX element reported
+    /// `frame=nil` or `role=AXApplication`). Set by `performResume`'s
+    /// stale-handle detector and consumed by `ResumeRetryPolicy.action`, so
+    /// `.inputNotFound` on a stale handle gets the long, renderer-friendly
+    /// retry budget instead of the tight default (the 2026-06-19 14:40 case
+    /// had Claude's renderer take the better part of a minute to repopulate
+    /// its chat panel after the rate-limit countdown ended, far longer than
+    /// the old 5×30s budget).
+    private var pendingResumeHadStaleHandle: [String: Bool] = [:]
     /// Consecutive non-`.sent` resume outcomes for a window, for a reset time
     /// that hasn't passed. Incremented on `.retry`, cleared on any other
     /// outcome. Passed to `ResumeRetryPolicy` so a window stuck returning
@@ -574,19 +584,81 @@ public final class Watcher {
             return
         }
 
-        let resumeOutcome = ResumeActuator.resume(window: adapter.element)
+        // Stale-handle detector. When Claude's `kAXWindowsAttribute` is
+        // briefly empty or returns a single stale reference (e.g. when the
+        // renderer is busy or the window is off-Space), the adapter we get
+        // back can have `role=AXApplication` (the app element, not a window)
+        // or `frame=nil` (the AXUIElement exists but reports no geometry).
+        // Calling the actuator on such a handle returns `.inputNotFound`
+        // 6 times in a row (the 2026-06-18 22:10 case). Cross-check with
+        // the WindowServer before retrying: if Claude also has no on-screen
+        // window per `CGWindowList`, the window genuinely isn't there, and
+        // a stronger nudge can't conjure it. Bail out, transition to
+        // `.suppressed`, and let the next poll re-evaluate (when Claude's
+        // window comes back, the next banner detection re-schedules).
+        //
+        // The 2026-06-19 14:40 case repeated this pattern after the
+        // stronger-nudge escalation still didn't surface a chat input — the
+        // renderer took long enough to repopulate that the 5×30s retry
+        // window ran out. We now also hand the `cgBounds` to the actuator
+        // so it can post a click at the on-screen center as part of the
+        // nudge, and the actuator's new wait-loop polls the AX tree for
+        // up to 12s after the activation steps instead of probing once.
+        let adapterRole = adapter.role
+        let adapterFrame = adapter.frame
+        let looksStale = adapterRole == "AXApplication" || adapterFrame == nil
+        var cgBounds: CGRect? = nil
+        if looksStale {
+            cgBounds = ClaudeWindowPresence.claudeOnScreenBounds()
+            if cgBounds == nil {
+                let detail = "Stale AX handle (role=\(adapterRole ?? "nil"), frame=\(adapterFrame == nil ? "nil" : "present")) and CGWindowList shows no Claude window on-screen. Will re-evaluate on the next poll; if Claude's window comes back, the banner will be re-detected and a fresh resume scheduled."
+                Self.appendDebugLog("[staleHandle \(windowID)] \(detail)")
+                log(.resumeGaveUp, windowID: windowID, detail: detail)
+                retryCounts.removeValue(forKey: windowID)
+                tracker.transition(windowID: windowID, to: .suppressed(since: Date()))
+                updateSummary()
+                return
+            }
+            // CGWindowList sees Claude but AX is stale. The stronger nudge
+            // in the actuator (`NSRunningApplication.activate` →
+            // `TransformProcessType`) might still wake it up. Log the
+            // discrepancy and proceed — `cgBounds` is also handed to the
+            // actuator so it can click the on-screen center before falling
+            // back to process-level activation alone.
+                Self.appendDebugLog("[staleHandle \(windowID)] AX handle is stale (role=\(adapterRole ?? "nil"), frame=\(adapterFrame == nil ? "nil" : "present")) but CGWindowList shows Claude on-screen at \(String(describing: cgBounds)). Trying actuator with stronger nudge.")
+        }
+
+        let resumeOutcome = ResumeActuator.resume(window: adapter.element, cgBounds: cgBounds)
         log(.resumed, windowID: windowID, detail: "Outcome: \(resumeOutcome)")
+
+        // Remember whether THIS attempt had a stale handle, so the retry
+        // policy can give `.inputNotFound` a longer recovery window when the
+        // renderer is the bottleneck (vs. a transient AX hiccup, which the
+        // tight default budget rides out fine). Cleared after the policy
+        // consumes it, so subsequent unrelated resumes don't inherit it.
+        pendingResumeHadStaleHandle[windowID] = looksStale
 
         if resumeOutcome == .inputNotFound {
             Self.appendDebugLog("[inputNotFound \(windowID) title=\(tracked.title ?? "nil")]")
+            // Cross-reference CGWindowList at the point of failure so a
+            // future post-mortem can tell whether Claude was on-screen but
+            // AX refused to introspect it (the 2026-06-19 14:40 shape) vs.
+            // genuinely gone. Without this we can't distinguish "renderer
+            // is busy" from "AX permission lost".
+            if let cgBounds {
+                Self.appendDebugLog("[inputNotFound \(windowID)]   CGWindowList sees Claude on-screen at \(cgBounds)")
+            } else {
+                Self.appendDebugLog("[inputNotFound \(windowID)]   CGWindowList does not see Claude on-screen")
+            }
             for line in AXTreeDiagnostics.describe(root: tracked.element) {
                 Self.appendDebugLog("[inputNotFound \(windowID)]   \(line)")
             }
         }
 
         let wasStale = pendingResumeWasStale.removeValue(forKey: windowID) ?? false
+        let staleHandle = pendingResumeHadStaleHandle.removeValue(forKey: windowID) ?? false
         let retryCount = retryCounts[windowID] ?? 0
-        switch ResumeRetryPolicy.action(for: resumeOutcome, wasStale: wasStale, retryBackoff: resumeRetryBackoff, retryCount: retryCount) {
+        switch ResumeRetryPolicy.action(for: resumeOutcome, wasStale: wasStale, retryBackoff: resumeRetryBackoff, retryCount: retryCount, staleHandle: staleHandle) {
         case .idle:
             retryCounts.removeValue(forKey: windowID)
             tracker.transition(windowID: windowID, to: .idle)
@@ -698,22 +770,10 @@ public final class Watcher {
 
     /// Appends a timestamped line to a dedicated debug log file separate from
     /// the main activity log — keeps noise out of the normal log while still
-    /// persisting across polls for post-hoc analysis.
+    /// persisting across polls for post-hoc analysis. Thin shim to
+    /// `DebugLog.append` (in `ClaudeAutoResumeCore`) so the same writer can
+    /// be used by the AX layer.
     static func appendDebugLog(_ line: String) {
-        print("Debug - \(line)")
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ClaudeAutoResume", isDirectory: true)
-        let url = dir.appendingPathComponent("debug.log")
-        let ts = ISO8601DateFormatter().string(from: Date())
-        let entry = "\(ts) \(line)\n"
-        if let data = entry.data(using: .utf8) {
-            if let handle = try? FileHandle(forWritingTo: url) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                try? handle.close()
-            } else {
-                try? data.write(to: url, options: .atomic)
-            }
-        }
+        DebugLog.append(line)
     }
 }

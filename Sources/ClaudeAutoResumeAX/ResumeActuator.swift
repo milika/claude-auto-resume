@@ -1,6 +1,8 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Carbon
+import ClaudeAutoResumeCore
 
 public enum ResumeActuator {
     public enum Outcome: Equatable {
@@ -18,8 +20,23 @@ public enum ResumeActuator {
     /// lags. 35ms is in the safe middle.
     private static let perKeystrokeDelay: TimeInterval = 0.035
 
+    /// Total time, in seconds, to keep polling the AX tree for a freshly
+    /// rendered text input after every nudge has run. The 2026-06-19 14:40
+    /// activity log showed Claude's renderer took the better part of a minute
+    /// to repopulate its chat panel after the rate-limit countdown ended —
+    /// a single post-nudge AX probe wasn't enough. We poll every
+    /// `postNudgePollInterval` seconds up to this total, so the actuator
+    /// either finds an input or times out cleanly with the same `.inputNotFound`
+    /// outcome the caller already handles.
+    private static let postNudgeWaitBudget: TimeInterval = 12.0
+    private static let postNudgePollInterval: TimeInterval = 0.5
+
     /// Types `continue` into the window's message input and triggers send.
-    public static func resume(window: AXUIElement) -> Outcome {
+    /// `cgBounds` is the on-screen bounds reported by `CGWindowList` for
+    /// the window's pid, if known — used as a click-target when AX itself
+    /// reports `frame == nil` (see `nudgeAndRefindInput`). Pass `nil` if the
+    /// caller didn't run that cross-check.
+    public static func resume(window: AXUIElement, cgBounds: CGRect? = nil) -> Outcome {
         AXUIElementPerformAction(window, kAXRaiseAction as CFString)
 
         let root = AXUIElementAdapter(window)
@@ -45,7 +62,7 @@ public enum ResumeActuator {
         //                     elements in the tree, because Claude was in the
         //                     background.)
         if inputAdapter == nil {
-            inputAdapter = nudgeAndRefindInput(window: window, root: root)
+            inputAdapter = nudgeAndRefindInput(window: window, root: root, cgBounds: cgBounds)
         }
 
         guard let inputAdapter else {
@@ -99,34 +116,128 @@ public enum ResumeActuator {
     }
 
     /// Best-effort nudge to bring Claude to the front when its AX tree doesn't
-    /// expose a chat input. Tries (in order): click the window center if AX
-    /// reports a frame, otherwise frontmost the whole application. Returns the
-    /// (possibly newly discovered) input adapter, or `nil` if no nudge
-    /// succeeded.
+    /// expose a chat input. Tries, in order:
+    ///   1. Click the window center if AX reports a frame, otherwise click
+    ///      the `cgBounds` center from `CGWindowList` (if provided).
+    ///   2. `NSRunningApplication.activate` (polite, 1.0s settle).
+    ///   3. `TransformProcessType(.foregroundApplication)` (the Carbon hammer
+    ///      used internally when an app launches and needs to come to the
+    ///      front — bypasses "don't steal focus" but works where step 2 was
+    ///      refused).
+    ///   4. Wait-loop polling the AX tree for up to `postNudgeWaitBudget`
+    ///      seconds, in case the renderer needs more time to repopulate the
+    ///      chat panel after the activation finally landed.
+    /// Returns the (possibly newly discovered) input adapter, or `nil` if
+    /// no nudge succeeded and the wait budget elapsed.
+    ///
+    /// Every step writes a line to `debug.log` so a future "the actuator
+    /// gave up and I can't tell why" post-mortem has evidence. The 2026-06-19
+    /// 14:40 case previously logged only "root role=AXApplication frame=nil"
+    /// after the fact — there was no record of whether `activate` had returned
+    /// `true` or whether `TransformProcessType` had succeeded, so we couldn't
+    /// tell if the escalation was being refused or just not getting enough
+    /// settle time.
     ///
     /// Exposed `internal` for unit testing of the failure paths — see
     /// `ResumeActuatorTests`.
     internal static func nudgeAndRefindInput(
         window: AXUIElement,
-        root: AXUIElementAdapter
+        root: AXUIElementAdapter,
+        cgBounds: CGRect? = nil
     ) -> AXUIElementAdapter? {
+        var pid: pid_t = 0
+        let pidOK = AXUIElementGetPid(window, &pid) == .success
+        ClaudeAutoResumeCore.DebugLog.append(
+            "[nudge] start: pidOK=\(pidOK) pid=\(pid) axFrame=\(root.frame.map { "\($0)" } ?? "nil") cgBounds=\(cgBounds.map { "\($0)" } ?? "nil") initialTextInputs=\(countTextInputs(in: root))")
+
+        // Step 1a: AX frame present — click that center.
         if let frame = root.frame {
             clickCenter(of: frame, window: window)
-            return AXTreeWalker.findFirst(in: root, where: { isTextInput($0) }) as? AXUIElementAdapter
+            ClaudeAutoResumeCore.DebugLog.append("[nudge] clicked AX-frame center \(frame.midX),\(frame.midY); waiting 1.0s")
+            Thread.sleep(forTimeInterval: 1.0)
+            if let found = AXTreeWalker.findFirst(in: root, where: { isTextInput($0) }) as? AXUIElementAdapter {
+                ClaudeAutoResumeCore.DebugLog.append("[nudge] AX-frame click succeeded; textInputs=\(countTextInputs(in: root))")
+                return found
+            }
+            ClaudeAutoResumeCore.DebugLog.append("[nudge] AX-frame click did not surface a text input; postTextInputs=\(countTextInputs(in: root))")
         }
 
-        // frame == nil — Claude isn't frontmost at all. Frontmost the
-        // application (kAXRaiseAction on the window alone doesn't work for
-        // Electron apps behind other windows or on another Space).
-        var pid: pid_t = 0
-        guard AXUIElementGetPid(window, &pid) == .success,
-              let app = NSRunningApplication(processIdentifier: pid),
-              app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
-        else { return nil }
+        // Step 1b: frame == nil but CGWindowList has on-screen bounds — click
+        // the CGWindowList center instead. The 2026-06-19 14:40 case had
+        // CGWindowList seeing Claude at (2465, 90, 1200, 800) while AX
+        // reported frame=nil; the previous code skipped `clickCenter`
+        // entirely on the nil-frame path and went straight to process-level
+        // activate, which alone didn't wake the renderer.
+        if let cgBounds {
+            clickCenter(of: cgBounds, window: window)
+            ClaudeAutoResumeCore.DebugLog.append("[nudge] clicked CGWindowList center \(cgBounds.midX),\(cgBounds.midY); waiting 1.0s")
+            Thread.sleep(forTimeInterval: 1.0)
+            if let found = AXTreeWalker.findFirst(in: root, where: { isTextInput($0) }) as? AXUIElementAdapter {
+                ClaudeAutoResumeCore.DebugLog.append("[nudge] CGWindowList-bounds click succeeded; textInputs=\(countTextInputs(in: root))")
+                return found
+            }
+            ClaudeAutoResumeCore.DebugLog.append("[nudge] CGWindowList-bounds click did not surface a text input; postTextInputs=\(countTextInputs(in: root))")
+        }
 
-        // Give AX a moment to repopulate the tree before re-searching.
-        Thread.sleep(forTimeInterval: 0.5)
-        return AXTreeWalker.findFirst(in: root, where: { isTextInput($0) }) as? AXUIElementAdapter
+        guard pidOK, let app = NSRunningApplication(processIdentifier: pid) else {
+            ClaudeAutoResumeCore.DebugLog.append("[nudge] no resolvable pid for window; giving up")
+            return nil
+        }
+
+        // Step 2: polite activation.
+        let activated = app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+        ClaudeAutoResumeCore.DebugLog.append("[nudge] NSRunningApplication.activate returned \(activated); isActive=\(app.isActive) isFinishedLaunching=\(app.isFinishedLaunching); waiting 1.0s")
+        Thread.sleep(forTimeInterval: 1.0)
+        if let found = AXTreeWalker.findFirst(in: root, where: { isTextInput($0) }) as? AXUIElementAdapter {
+            ClaudeAutoResumeCore.DebugLog.append("[nudge] activate alone surfaced a text input; textInputs=\(countTextInputs(in: root))")
+            return found
+        }
+
+        // Step 3: force-elevate the process to foreground. This is the same
+        // hammer macOS uses internally when an app launches and needs to come
+        // to the front — it can succeed where NSRunningApplication.activate
+        // was refused, at the cost of bypassing the user's "don't steal focus"
+        // preference. For our use case (Claude behind another fullscreen app
+        // during a rate-limit countdown) that's the right tradeoff.
+        //
+        // `GetProcessForPID` is deprecated as of macOS 10.9 and Swift marks
+        // it unavailable, but the underlying C function still works. We
+        // construct the `ProcessSerialNumber` directly: for any modern
+        // launchd-spawned process (which Claude Desktop is), the high 32
+        // bits of the PSN are 0 and the low 32 bits are the pid.
+        var psn = ProcessSerialNumber(highLongOfPSN: 0, lowLongOfPSN: UInt32(pid))
+        let transformStatus = TransformProcessType(&psn,
+                                                   ProcessApplicationTransformState(kProcessTransformToForegroundApplication))
+        ClaudeAutoResumeCore.DebugLog.append("[nudge] TransformProcessType returned OSStatus=\(transformStatus); waiting 1.0s")
+        Thread.sleep(forTimeInterval: 1.0)
+        if let found = AXTreeWalker.findFirst(in: root, where: { isTextInput($0) }) as? AXUIElementAdapter {
+            ClaudeAutoResumeCore.DebugLog.append("[nudge] TransformProcessType alone surfaced a text input; textInputs=\(countTextInputs(in: root))")
+            return found
+        }
+
+        // Step 4: wait-loop. The activation has either succeeded or been
+        // refused by now; what we're waiting on is the renderer repopulating
+        // the chat panel. Polling every 0.5s gives us up to
+        // `postNudgeWaitBudget` seconds of observation before giving up.
+        let deadline = Date().addingTimeInterval(postNudgeWaitBudget)
+        var polls = 0
+        while Date() < deadline {
+            Thread.sleep(forTimeInterval: postNudgePollInterval)
+            polls += 1
+            if let found = AXTreeWalker.findFirst(in: root, where: { isTextInput($0) }) as? AXUIElementAdapter {
+                ClaudeAutoResumeCore.DebugLog.append("[nudge] wait-loop found a text input after \(polls) polls (\(Double(polls) * postNudgePollInterval)s)")
+                return found
+            }
+        }
+        ClaudeAutoResumeCore.DebugLog.append("[nudge] wait-loop exhausted (\(polls) polls, ~\(Double(polls) * postNudgePollInterval)s); finalTextInputs=\(countTextInputs(in: root)) rootRole=\(root.role ?? "nil") rootFrame=\(root.frame.map { "\($0)" } ?? "nil")")
+        return nil
+    }
+
+    /// Counts AXTextArea / AXTextField descendants in the tree rooted at
+    /// `root`. Cheap enough to call at every nudge step (one DFS, no
+    /// attribute queries beyond role).
+    private static func countTextInputs(in root: AXUIElementAdapter) -> Int {
+        AXTreeWalker.findAll(in: root, where: isTextInput).count
     }
 
     /// Posts a left-click at the center of `frame` directly to `window`'s
