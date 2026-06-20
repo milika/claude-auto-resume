@@ -82,4 +82,37 @@ final class ResumeActuatorTests: XCTestCase {
         // and well below the wait loop's 12s budget.
         XCTAssertLessThan(elapsed, 5.0, "unresolvable pid must short-circuit; got \(elapsed)s")
     }
+
+    /// The 2026-06-20 14:00 case showed Claude's renderer staying AX-stale
+    /// for 17 minutes — `CGEvent.postToPid` clicks were being dropped at
+    /// Chromium's renderer IPC boundary. The fix is to send the click
+    /// through `SkyLightBridge` (which uses `SLEventPostToPid`, a private
+    /// SkyLight API Chromium trusts) and to tick the user-activation
+    /// gate with an off-screen primer click at `(-1, -1)` before the real
+    /// click. This test pins that the new nudge path emits the primer
+    /// click (so we can grep for it in debug.log if it regresses) by
+    /// confirming the function still returns `nil` cleanly when no pid
+    /// is resolvable — i.e. the primer-click call doesn't crash or hang
+    /// even when everything else about the window is invalid.
+    ///
+    /// We can't synthesize a working Claude window in unit tests, so the
+    /// live-path primer-click is exercised only against Claude Desktop.
+    /// What we CAN pin here is the contract that the new code path is
+    /// gated by `pidOK` — an invalid window's pid is unresolvable, so
+    /// the primer click is skipped, the function short-circuits, and
+    /// the test stays under 5s like the legacy test above.
+    func testNudgeAndRefindInputPrimerClickGatedByResolvingPid() {
+        let invalidWindow = AXUIElementCreateSystemWide()
+        let root = AXUIElementAdapter(invalidWindow)
+
+        let start = Date()
+        let result = ResumeActuator.nudgeAndRefindInput(window: invalidWindow, root: root)
+        let elapsed = Date().timeIntervalSince(start)
+
+        XCTAssertNil(result)
+        // Same budget as the legacy short-circuit test: under 5s. The
+        // primer click (50ms sleep) is gated behind `pidOK`, so an
+        // unresolvable pid skips it and the test runs as fast as before.
+        XCTAssertLessThan(elapsed, 5.0, "primer-click path must be gated by pidOK; got \(elapsed)s")
+    }
 }

@@ -148,7 +148,19 @@ public enum ResumeActuator {
         var pid: pid_t = 0
         let pidOK = AXUIElementGetPid(window, &pid) == .success
         ClaudeAutoResumeCore.DebugLog.append(
-            "[nudge] start: pidOK=\(pidOK) pid=\(pid) axFrame=\(root.frame.map { "\($0)" } ?? "nil") cgBounds=\(cgBounds.map { "\($0)" } ?? "nil") initialTextInputs=\(countTextInputs(in: root))")
+            "[nudge] start: pidOK=\(pidOK) pid=\(pid) axFrame=\(root.frame.map { "\($0)" } ?? "nil") cgBounds=\(cgBounds.map { "\($0)" } ?? "nil") initialTextInputs=\(countTextInputs(in: root)) trustedClick=\(SkyLightBridge.isTrustedClickAvailable)")
+
+        // Tick Chromium's user-activation gate before the real click. Claude
+        // may have been idle (window occluded, renderer paused AX updates)
+        // since the rate-limit banner appeared, so the gate is in its
+        // "no recent trusted gesture" state and will reject the click that
+        // follows. The primer at (-1, -1) is discarded by Chromium but
+        // ticks the gate forward, so the real click a few ms later is
+        // treated as a trusted continuation.
+        if pidOK {
+            postPrimerClick(toPid: pid)
+            ClaudeAutoResumeCore.DebugLog.append("[nudge] posted user-activation primer click at (-1, -1)")
+        }
 
         // Step 1a: AX frame present — click that center.
         if let frame = root.frame {
@@ -243,18 +255,43 @@ public enum ResumeActuator {
     /// Posts a left-click at the center of `frame` directly to `window`'s
     /// process — best-effort, ignores failures, since this is only a
     /// best-effort nudge before falling back to `.inputNotFound`.
+    ///
+    /// Uses `SkyLightBridge.click` rather than `CGEvent.postToPid` so the
+    /// click travels through the WindowServer-trusted channel Chromium's
+    /// renderer accepts. The 2026-06-19 14:40 / 2026-06-20 14:00 cases
+    /// showed `postToPid` clicks being dropped at the Chromium renderer IPC
+    /// boundary — the renderer never surfaced a chat input in the AX
+    /// tree after our synthetic clicks, even with the stronger-nudge path
+    /// we shipped in v1.2 (build 6). Real user clicks did work (the 16:01
+    /// resume that finally went through, immediately after the user
+    /// clicked into Claude's chat panel, confirmed it). SkyLight's
+    /// `SLEventPostToPid` is the only per-pid route Chromium accepts as
+    /// trusted. Falls back to `CGEvent.postToPid` if the symbol is missing
+    /// on this macOS — same degradation as cua-driver uses.
     private static func clickCenter(of frame: CGRect, window: AXUIElement) {
         var pid: pid_t = 0
         guard AXUIElementGetPid(window, &pid) == .success else { return }
-
         let point = CGPoint(x: frame.midX, y: frame.midY)
-        let source = CGEventSource(stateID: .hidSystemState)
-        guard let mouseDown = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
-              let mouseUp = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left) else {
-            return
-        }
-        mouseDown.postToPid(pid)
-        mouseUp.postToPid(pid)
+        SkyLightBridge.click(at: point, toPid: pid)
+    }
+
+    /// Posts a single off-screen click at `(-1, -1)` — a coordinate no
+    /// window on screen claims. Chromium discards the click (no element
+    /// receives it) but its **user-activation gate** still ticks forward.
+    /// The real click that follows within a few hundred milliseconds is
+    /// then treated by Chromium as a trusted continuation of a real user
+    /// gesture, so it lands in the renderer's input pipeline. Without the
+    /// primer, even `SLEventPostToPid`-routed clicks can fail the
+    /// user-activation gate after Claude has been idle — observed on
+    /// 2026-06-20 14:00 when the renderer wouldn't accept any synthetic
+    /// click for 17 minutes. The cua-driver team reverse-engineered this
+    /// trick: https://news.ycombinator.com/item?id=47936312
+    private static func postPrimerClick(toPid pid: pid_t) {
+        SkyLightBridge.click(at: CGPoint(x: -1, y: -1), toPid: pid)
+        // Brief settle so the user-activation gate ticks before the real
+        // click arrives. cua found this works at "a few milliseconds";
+        // 50ms is comfortably above noise and below human perception.
+        Thread.sleep(forTimeInterval: 0.05)
     }
 
     private static func isTextInput(_ element: AccessibilityElement) -> Bool {
