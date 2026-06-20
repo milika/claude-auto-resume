@@ -314,4 +314,159 @@ final class RateLimitDetectorTests: XCTestCase {
 
         XCTAssertEqual(RateLimitDetector.detect(in: tree, now: now), .none)
     }
+
+    // MARK: - Merged-element banner (Fix 1: "session limit" keyword)
+
+    /// The 2026-06-19 21:33 regression: Claude Desktop rendered the banner
+    /// and reset time as a single AX text element — "You've hit your session
+    /// limit · resets 1:40am (Europe/Belgrade)" — and `bannerKeywords` did
+    /// not contain "session limit", so the element matched nothing. Adding
+    /// "session limit" to the keyword list lets the primary path pick it
+    /// up; the inline parse in `detect` then recovers the reset time
+    /// directly from the element's text without needing a sibling scan.
+    func testDetectsMergedInlineSessionLimitBanner() {
+        let tree = MockElement(role: "window", children: [
+            MockElement(role: "group", children: [
+                MockElement(role: "text",
+                            value: "You've hit your session limit · resets 1:40am (Europe/Belgrade)")
+            ])
+        ])
+
+        let result = RateLimitDetector.detect(in: tree, now: now)
+
+        guard case .rateLimited(let resetAt, let rawText) = result else {
+            return XCTFail("expected .rateLimited for merged session-limit banner, got \(result)")
+        }
+        XCTAssertEqual(rawText, "You've hit your session limit · resets 1:40am (Europe/Belgrade)")
+        // The reset time must be 1:40 AM Belgrade today, NOT 13:40 (no
+        // AM/PM trap regression) and NOT 1:40 AM tomorrow (no double-roll).
+        var belgradeCalendar = Calendar(identifier: .gregorian)
+        belgradeCalendar.timeZone = TimeZone(identifier: "Europe/Belgrade") ?? belgradeCalendar.timeZone
+        let comps = belgradeCalendar.dateComponents([.year, .month, .day, .hour, .minute], from: resetAt)
+        XCTAssertEqual(comps.hour, 1)
+        XCTAssertEqual(comps.minute, 40)
+    }
+
+    // MARK: - Inline-banner fallback (Fix 2: defense-in-depth)
+
+    /// When Claude introduces a banner phrasing the primary `bannerKeywords`
+    /// list does not know (here, "Daily limit reached" — Claude may add
+    /// such phrasings in future Claude Desktop updates without notice), the
+    /// inline-banner fallback must still recover the rate limit. The element
+    /// shape is the same as the merged session-limit case above: banner
+    /// phrasing and reset time in a single AX text element.
+    func testDetectsMergedInlineBannerWhenKeywordUnknownToPrimaryList() {
+        let tree = MockElement(role: "window", children: [
+            MockElement(role: "group", children: [
+                MockElement(role: "text",
+                            value: "Daily limit reached · Resets 3pm")
+            ])
+        ])
+
+        let result = RateLimitDetector.detect(in: tree, now: now)
+
+        guard case .rateLimited(_, let rawText) = result else {
+            return XCTFail("expected .rateLimited via inline fallback, got \(result)")
+        }
+        XCTAssertEqual(rawText, "Daily limit reached · Resets 3pm")
+    }
+
+    /// The inline-banner fallback must not fire on chat prose that merely
+    /// *mentions* a limit and a reset time deep inside a longer sentence.
+    /// The `maxInlineBannerTextLength` cap is the guard: real banner labels
+    /// are short, prose is long. Without the cap every chat reply discussing
+    /// past rate limits would falsely schedule resumes.
+    func testIgnoresLongProseInInlineFallback() {
+        let prose = "Looking back at the deploy notes from yesterday, we discussed the " +
+            "rate limit recovery flow when 'limit' was hit and the system scheduled a " +
+            "resumes at 3pm — but the actuator failed to type 'continue' for unrelated reasons."
+        XCTAssertGreaterThan(prose.count, 100, "prose fixture should exceed the inline cap")
+
+        let tree = MockElement(role: "window", children: [
+            MockElement(role: "text", value: prose)
+        ])
+
+        XCTAssertEqual(RateLimitDetector.detect(in: tree, now: now), .none)
+    }
+
+    /// The inline-banner fallback shares the primary path's "approaching"
+    /// guard. "Approaching weekly usage limit · Resets Mon, Jun 15, 7:00 PM"
+    /// fits every other shape of an inline banner (short, contains "limit",
+    /// parseable reset time) but is informational, not blocking — firing on
+    /// it would schedule a phantom resume for a window that was never
+    /// rate-limited.
+    func testIgnoresApproachingInInlineFallback() {
+        let tree = MockElement(role: "window", children: [
+            MockElement(role: "text",
+                        value: "Approaching weekly usage limit · Resets Mon, Jun 15, 7:00 PM")
+        ])
+
+        XCTAssertEqual(RateLimitDetector.detect(in: tree, now: now), .none)
+    }
+
+    /// When two inline-shape banners are present, the fallback must pick the
+    /// bottommost (most recent on screen) one — matching the same rule the
+    /// primary path uses via `findAll(...).max(by: minY)`. Older scrolled-up
+    /// banners must not pull reset times forward from the active card.
+    func testInlineFallbackPicksBottommost() {
+        let tree = MockElement(role: "window", children: [
+            // Old (scrolled past, y=100)
+            MockElement(role: "text",
+                        value: "You've hit your session limit · resets 2:00pm",
+                        frame: CGRect(x: 0, y: 100, width: 400, height: 24)),
+            // Active (currently visible, y=600)
+            MockElement(role: "text",
+                        value: "You've hit your session limit · resets 8:00pm",
+                        frame: CGRect(x: 0, y: 600, width: 400, height: 24))
+        ])
+
+        let result = RateLimitDetector.detect(in: tree, now: now)
+
+        guard case .rateLimited(_, let rawText) = result else {
+            return XCTFail("expected .rateLimited for bottommost inline banner, got \(result)")
+        }
+        XCTAssertEqual(rawText, "You've hit your session limit · resets 8:00pm")
+    }
+
+    /// When the primary path already detected a banner element, the inline
+    /// fallback must NOT override its `.unrecognized` outcome with a parseable
+    /// element from elsewhere in the tree. The design rule: if a banner
+    /// element is recognized, trust it and report `.unrecognized` when its
+    /// own time isn't recoverable — don't reach across the tree for a
+    /// different element's reset time. (This is the same rule that
+    /// `findNearbyParseableReset` enforces for the primary path.)
+    func testPrimaryBannerDetectionTakesPrecedenceOverInlineFallback() {
+        let tree = MockElement(role: "window", children: [
+            // Primary banner (matched by "server is temporarily limiting requests")
+            MockElement(role: "text",
+                        value: "Server is temporarily limiting requests",
+                        frame: CGRect(x: 0, y: 600, width: 400, height: 24)),
+            // Inline-shape banner elsewhere — must NOT override the primary
+            // banner's .unrecognized outcome with its parseable reset time
+            MockElement(role: "text",
+                        value: "You've hit your session limit · resets 8:00pm",
+                        frame: CGRect(x: 0, y: 100, width: 400, height: 24))
+        ])
+
+        let result = RateLimitDetector.detect(in: tree, now: now)
+
+        guard case .unrecognized(let rawText) = result else {
+            return XCTFail("primary banner must take precedence — got \(result)")
+        }
+        XCTAssertEqual(rawText, "Server is temporarily limiting requests")
+    }
+
+    /// A sidebar label like "Idle rate limit recovery" contains "limit" but
+    /// carries no parseable reset time — the inline fallback's parseability
+    /// guard must keep it from matching even when no primary banner element
+    /// is present in the tree.
+    func testInlineFallbackIgnoresSidebarLabelWithoutResetTime() {
+        let tree = MockElement(role: "window", children: [
+            MockElement(role: "text",
+                        value: "Idle rate limit recovery",
+                        frame: CGRect(x: 0, y: 200, width: 400, height: 24))
+        ])
+
+        XCTAssertEqual(RateLimitDetector.detect(in: tree, now: now), .none)
+    }
 }
